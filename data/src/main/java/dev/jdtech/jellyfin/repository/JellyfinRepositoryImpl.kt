@@ -17,6 +17,7 @@ import dev.jdtech.jellyfin.models.FindroidSegmentType
 import dev.jdtech.jellyfin.models.FindroidShow
 import dev.jdtech.jellyfin.models.FindroidSource
 import dev.jdtech.jellyfin.models.SortBy
+import dev.jdtech.jellyfin.models.VideoQuality
 import dev.jdtech.jellyfin.models.toFindroidCollection
 import dev.jdtech.jellyfin.models.toFindroidEpisode
 import dev.jdtech.jellyfin.models.toFindroidItem
@@ -29,21 +30,35 @@ import io.ktor.util.toByteArray
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
+import org.jellyfin.sdk.api.client.Response
+import org.jellyfin.sdk.api.client.extensions.dynamicHlsApi
 import org.jellyfin.sdk.api.client.extensions.get
+import org.jellyfin.sdk.api.client.extensions.hlsSegmentApi
 import org.jellyfin.sdk.model.api.BaseItemDto
 import org.jellyfin.sdk.model.api.BaseItemKind
+import org.jellyfin.sdk.model.api.ClientCapabilitiesDto
 import org.jellyfin.sdk.model.api.DeviceOptionsDto
 import org.jellyfin.sdk.model.api.DeviceProfile
+import org.jellyfin.sdk.model.api.DirectPlayProfile
+import org.jellyfin.sdk.model.api.DlnaProfileType
+import org.jellyfin.sdk.model.api.EncodingContext
 import org.jellyfin.sdk.model.api.GeneralCommandType
 import org.jellyfin.sdk.model.api.ItemFields
 import org.jellyfin.sdk.model.api.ItemFilter
 import org.jellyfin.sdk.model.api.ItemSortBy
+import org.jellyfin.sdk.model.api.MediaStreamProtocol
 import org.jellyfin.sdk.model.api.MediaType
 import org.jellyfin.sdk.model.api.PlaybackInfoDto
+import org.jellyfin.sdk.model.api.PlaybackInfoResponse
+import org.jellyfin.sdk.model.api.ProfileCondition
+import org.jellyfin.sdk.model.api.ProfileConditionType
+import org.jellyfin.sdk.model.api.ProfileConditionValue
 import org.jellyfin.sdk.model.api.PublicSystemInfo
 import org.jellyfin.sdk.model.api.SortOrder
 import org.jellyfin.sdk.model.api.SubtitleDeliveryMethod
 import org.jellyfin.sdk.model.api.SubtitleProfile
+import org.jellyfin.sdk.model.api.TranscodeSeekInfo
+import org.jellyfin.sdk.model.api.TranscodingProfile
 import org.jellyfin.sdk.model.api.UserConfiguration
 import timber.log.Timber
 import java.io.File
@@ -309,13 +324,15 @@ class JellyfinRepositoryImpl(
             sources
         }
 
-    override suspend fun getStreamUrl(itemId: UUID, mediaSourceId: String): String =
+    override suspend fun getStreamUrl(itemId: UUID, mediaSourceId: String, playSessionId: String?,
+    ): String =
         withContext(Dispatchers.IO) {
             try {
                 jellyfinApi.videosApi.getVideoStreamUrl(
                     itemId,
                     static = true,
                     mediaSourceId = mediaSourceId,
+                    playSessionId = playSessionId,
                 )
             } catch (e: Exception) {
                 Timber.e(e)
@@ -530,7 +547,186 @@ class JellyfinRepositoryImpl(
             items
         }
 
-    override fun getUserId(): UUID {
-        return jellyfinApi.userId!!
+    override fun getUserId(): UUID = jellyfinApi.userId!!
+
+    override suspend fun buildDeviceProfile(
+        maxBitrate: Int,
+        container: String,
+        context: EncodingContext,
+    ): DeviceProfile {
+        val deviceProfile =
+            ClientCapabilitiesDto(
+                supportedCommands = emptyList(),
+                playableMediaTypes = emptyList(),
+                supportsMediaControl = true,
+                supportsPersistentIdentifier = true,
+                deviceProfile =
+                    DeviceProfile(
+                        name = "FindroidUser",
+                        id = getUserId().toString(),
+                        maxStaticBitrate = maxBitrate,
+                        maxStreamingBitrate = maxBitrate,
+                        codecProfiles = emptyList(),
+                        containerProfiles = listOf(),
+                        directPlayProfiles =
+                            listOf(
+                                DirectPlayProfile(type = DlnaProfileType.VIDEO),
+                                DirectPlayProfile(type = DlnaProfileType.AUDIO),
+                            ),
+                        transcodingProfiles =
+                            listOf(
+                                TranscodingProfile(
+                                    container = container,
+                                    context = context,
+                                    protocol = MediaStreamProtocol.HLS,
+                                    audioCodec = "aac",
+                                    videoCodec = appPreferences.transcodeCodec!!,
+                                    type = DlnaProfileType.VIDEO,
+                                    conditions =
+                                        listOf(
+                                            ProfileCondition(
+                                                condition = ProfileConditionType.LESS_THAN_EQUAL,
+                                                property = ProfileConditionValue.VIDEO_BITRATE,
+                                                value = "8000000",
+                                                isRequired = true,
+                                            ),
+                                        ),
+                                    copyTimestamps = true,
+                                    enableSubtitlesInManifest = true,
+                                    transcodeSeekInfo = TranscodeSeekInfo.AUTO,
+                                ),
+                            ),
+                        subtitleProfiles =
+                            listOf(
+                                SubtitleProfile("srt", SubtitleDeliveryMethod.EXTERNAL),
+                                SubtitleProfile("ass", SubtitleDeliveryMethod.EXTERNAL),
+                                SubtitleProfile("sub", SubtitleDeliveryMethod.EXTERNAL),
+                                SubtitleProfile("vtt", SubtitleDeliveryMethod.EXTERNAL),
+                                SubtitleProfile("ssa", SubtitleDeliveryMethod.EXTERNAL),
+                                SubtitleProfile("pgs", SubtitleDeliveryMethod.EXTERNAL),
+                                SubtitleProfile("dvb_teletext", SubtitleDeliveryMethod.EXTERNAL),
+                                SubtitleProfile("dvd_subtitle", SubtitleDeliveryMethod.EXTERNAL),
+                            ),
+                    ),
+            )
+        return deviceProfile.deviceProfile!!
+    }
+
+    override suspend fun getPostedPlaybackInfo(
+        itemId: UUID,
+        enableDirectStream: Boolean,
+        deviceProfile: DeviceProfile,
+        maxBitrate: Int,
+    ): Response<PlaybackInfoResponse> {
+        val playbackInfo =
+            jellyfinApi.mediaInfoApi.getPostedPlaybackInfo(
+                itemId = itemId,
+                PlaybackInfoDto(
+                    userId = jellyfinApi.userId!!,
+                    enableTranscoding = true,
+                    enableDirectPlay = false,
+                    enableDirectStream = enableDirectStream,
+                    autoOpenLiveStream = true,
+                    deviceProfile = deviceProfile,
+                    allowAudioStreamCopy = true,
+                    allowVideoStreamCopy = true,
+                    maxStreamingBitrate = maxBitrate,
+                ),
+            )
+        return playbackInfo
+    }
+
+    override suspend fun getVideoStreambyContainerUrl(
+        itemId: UUID,
+        deviceId: String,
+        mediaSourceId: String,
+        playSessionId: String,
+        videoBitrate: Int,
+        container: String,
+        maxHeight: Int,
+    ): String {
+        val url =
+            jellyfinApi.videosApi.getVideoStreamByContainerUrl(
+                itemId,
+                static = false,
+                deviceId = deviceId,
+                mediaSourceId = mediaSourceId,
+                playSessionId = playSessionId,
+                videoBitRate = videoBitrate,
+                audioBitRate = 128000,
+                videoCodec = appPreferences.transcodeCodec,
+                audioCodec = "aac",
+                container = container,
+                maxHeight = maxHeight,
+                startTimeTicks = 0,
+                copyTimestamps = true,
+                subtitleMethod = SubtitleDeliveryMethod.EXTERNAL,
+            )
+        return url
+    }
+
+    override suspend fun getTranscodedVideoStream(
+        itemId: UUID,
+        deviceId: String,
+        mediaSourceId: String,
+        playSessionId: String,
+        videoBitrate: Int,
+    ): String {
+        val isAuto = videoBitrate == VideoQuality.getBitrate(VideoQuality.Auto)
+        val url =
+            if (!isAuto) {
+                jellyfinApi.api.dynamicHlsApi.getMasterHlsVideoPlaylistUrl(
+                    itemId,
+                    static = false,
+                    deviceId = deviceId,
+                    mediaSourceId = mediaSourceId,
+                    playSessionId = playSessionId,
+                    videoBitRate = videoBitrate,
+                    enableAdaptiveBitrateStreaming = false,
+                    audioBitRate = 128000,
+                    videoCodec = appPreferences.transcodeCodec,
+                    audioCodec = "aac",
+                    startTimeTicks = 0,
+                    copyTimestamps = true,
+                    subtitleMethod = SubtitleDeliveryMethod.EXTERNAL,
+                    context = EncodingContext.STREAMING,
+                    segmentContainer = "ts",
+                    transcodeReasons = "ContainerBitrateExceedsLimit",
+                )
+            } else {
+                jellyfinApi.api.dynamicHlsApi.getMasterHlsVideoPlaylistUrl(
+                    itemId,
+                    static = false,
+                    deviceId = deviceId,
+                    mediaSourceId = mediaSourceId,
+                    playSessionId = playSessionId,
+                    enableAdaptiveBitrateStreaming = true,
+                    videoCodec = appPreferences.transcodeCodec,
+                    audioCodec = "aac",
+                    startTimeTicks = 0,
+                    copyTimestamps = true,
+                    subtitleMethod = SubtitleDeliveryMethod.EXTERNAL,
+                    context = EncodingContext.STREAMING,
+                    segmentContainer = "ts",
+                    transcodeReasons = "ContainerBitrateExceedsLimit",
+                )
+            }
+        return url
+    }
+
+    override suspend fun getDeviceId(): String {
+        return jellyfinApi.api.deviceInfo.id
+    }
+
+    override suspend fun stopEncodingProcess(playSessionId: String) {
+        val deviceId = getDeviceId()
+        jellyfinApi.api.hlsSegmentApi.stopEncodingProcess(
+            deviceId = deviceId,
+            playSessionId = playSessionId,
+        )
+    }
+
+    override suspend fun getAccessToken(): String? {
+        return jellyfinApi.api.accessToken
     }
 }
